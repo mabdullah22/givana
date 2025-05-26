@@ -96,29 +96,7 @@ pub struct TransferJitoVaultRewardToRewardPool<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-#[derive(Accounts)]
-pub struct ProcessRewards<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    #[account(
-        seeds = [b"global-state"],
-        bump
-    )]
-    pub global_state: Account<'info, GlobalState>,
-
-    #[account(
-        mut,
-        seeds = [b"user", user.key().as_ref()],
-        bump
-    )]
-    pub user_account: Account<'info, UserAccount>,
-
-    /// CHECK: This is the user's pubkey
-    pub user: AccountInfo<'info>,
-
-    pub system_program: Program<'info, System>,
-}
+// ProcessRewards struct definition is removed.
 
 // #[derive(Accounts)]
 // pub struct UpdateRewardAccumulators<'info> {
@@ -192,36 +170,8 @@ pub struct ClaimNgoRewards<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-#[derive(Accounts)]
-pub struct DistributeNgoRewards<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
+// DistributeNgoRewards struct is removed.
 
-    #[account(
-        mut,
-        seeds = [b"reward_pool_state_v2"],
-        bump
-    )]
-    pub reward_pool: Account<'info, RewardPool>,
-
-    #[account(
-        mut,
-        seeds = [b"global-state"],
-        bump
-    )]
-    pub global_state: Account<'info, GlobalState>,
-
-    /// The NGO account to distribute rewards to
-    #[account(
-        mut,
-        seeds = [b"ngo", ngo_account.authority.as_ref()],
-        bump,
-        constraint = ngo_account.is_active @ ErrorCode::NgoNotActive
-    )]
-    pub ngo_account: Account<'info, NGOAccount>,
-
-    pub system_program: Program<'info, System>,
-}
 #[derive(Accounts)]
 pub struct ClaimStakerRewards<'info> {
     #[account(mut)]
@@ -280,6 +230,116 @@ pub struct ClaimStakerRewards<'info> {
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
+
+// Internal helper function to update user rewards and credit NGO
+pub(crate) fn update_user_rewards_and_credit_ngo<'info>(
+    user_account: &mut Account<'info, UserAccount>,
+    global_state: &Account<'info, GlobalState>,
+    ngo_account_option: Option<&mut Account<'info, NGOAccount>>,
+) -> Result<()> {
+    let current_total_yield_acc = global_state.acc_total_yield_per_gsol;
+    let last_checkpoint = user_account.last_total_yield_checkpoint;
+
+    // If gSOL balance is zero, no rewards can be generated.
+    // Also, if yield hasn't changed, no new rewards.
+    // Update checkpoint only if current_total_yield_acc > last_checkpoint.
+    // If current_total_yield_acc == last_checkpoint, nothing changes, including checkpoint.
+    if user_account.gsol_balance == 0 {
+        if current_total_yield_acc > last_checkpoint {
+            user_account.last_total_yield_checkpoint = current_total_yield_acc;
+        }
+        return Ok(()); // No rewards to process as gsol_balance is zero
+    }
+
+    if current_total_yield_acc <= last_checkpoint {
+        // No new yield accumulated or an erroneous state (should not happen if time moves forward)
+        // No need to update checkpoint if it's already current or ahead.
+        return Ok(()); 
+    }
+
+    let delta_yield = current_total_yield_acc
+        .checked_sub(last_checkpoint) // Already checked current_total_yield_acc > last_checkpoint
+        .ok_or(ErrorCode::ArithmeticOverflow)?; 
+
+    let total_rewards_generated_by_stake_u128 = (user_account.gsol_balance as u128)
+        .checked_mul(delta_yield as u128)
+        .ok_or(ErrorCode::ArithmeticOverflow)?
+        .checked_div(PRECISION_FACTOR as u128)
+        .ok_or(ErrorCode::DivisionByZero)?; // PRECISION_FACTOR is non-zero
+    
+    if total_rewards_generated_by_stake_u128 == 0 {
+        // If no rewards were generated (e.g. due to truncation in division),
+        // still update the checkpoint and exit.
+        user_account.last_total_yield_checkpoint = current_total_yield_acc;
+        return Ok(());
+    }
+    
+    // Ensure it fits in u64
+    if total_rewards_generated_by_stake_u128 > u64::MAX as u128 {
+        return Err(error!(ErrorCode::ArithmeticOverflow));
+    }
+    let total_rewards_generated_by_stake_u64 = total_rewards_generated_by_stake_u128 as u64;
+
+    // This check is technically redundant now due to the u128 check above, 
+    // but kept for logical clarity if total_rewards_generated_by_stake_u64 could be 0 from other paths.
+    // if total_rewards_generated_by_stake_u64 > 0 { // Covered by total_rewards_generated_by_stake_u128 == 0 check
+        let ngo_donation_amount_u64: u64;
+        let user_net_reward_amount: u64;
+
+        if user_account.donation_rate > 0 && user_account.ngo_address != Pubkey::default() {
+            let ngo_donation_amount_u128 = (total_rewards_generated_by_stake_u64 as u128)
+                .checked_mul(user_account.donation_rate as u128) // donation_rate is u16 (0-10000)
+                .ok_or(ErrorCode::ArithmeticOverflow)?
+                .checked_div(10000 as u128) // Basis points division
+                .ok_or(ErrorCode::DivisionByZero)?; // 10000 is non-zero
+            
+            if ngo_donation_amount_u128 > u64::MAX as u128 {
+                 return Err(error!(ErrorCode::ArithmeticOverflow));
+            }
+            ngo_donation_amount_u64 = ngo_donation_amount_u128 as u64;
+
+            user_net_reward_amount = total_rewards_generated_by_stake_u64
+                .checked_sub(ngo_donation_amount_u64)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+            if let Some(ngo_account_ref_mut) = ngo_account_option {
+                // Ensure the provided NGO account matches the user's selected NGO
+                // This check is crucial: user_account.ngo_address must be the authority of the ngo_account_ref_mut
+                // For PDAs, the authority is often part of the seeds or a field in the account.
+                // Assuming ngo_account_ref_mut.authority field stores the NGO's identity key.
+                if ngo_account_ref_mut.key() == user_account.ngo_address {
+                     ngo_account_ref_mut.pending_claimable_donations = ngo_account_ref_mut.pending_claimable_donations
+                        .checked_add(ngo_donation_amount_u64)
+                        .ok_or(ErrorCode::ArithmeticOverflow)?;
+                } else {
+                    // msg!("Warning: Provided NGO account does not match user's selected NGO address.");
+                    // This case implies a mismatch in how accounts are loaded by the caller.
+                    // The donation for this user, for this transaction, will not be credited to the (wrong) NGO account.
+                    // It's also not being added to user_net_reward_amount, so it's effectively burned if this path is taken.
+                    // This should be an error or handled more gracefully by ensuring correct account loading.
+                }
+            } else {
+                // msg!("Warning: User has donation settings but no NGO account was provided to credit.");
+                // Similar to above, donation is effectively burned.
+            }
+        } else {
+            // No donation (rate is 0 or no NGO address)
+            ngo_donation_amount_u64 = 0;
+            user_net_reward_amount = total_rewards_generated_by_stake_u64;
+        }
+
+        if user_net_reward_amount > 0 {
+            user_account.pending_rewards = user_account.pending_rewards
+                .checked_add(user_net_reward_amount)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+        }
+    // } // End of if total_rewards_generated_by_stake_u64 > 0
+
+    user_account.last_total_yield_checkpoint = current_total_yield_acc;
+
+    Ok(())
+}
+
 // The Implementation Functions
 
 impl<'info> TransferJitoVaultRewardToRewardPool<'info> {
@@ -338,34 +398,28 @@ impl<'info> TransferJitoVaultRewardToRewardPool<'info> {
             return Err(error!(ErrorCode::TransferFailed));
         }
         // vault_token_balance is basically the total amount of jitoSOL in the reward pool
-        self.reward_pool.vault_token_balance = self.reward_pool.vault_token_balance.checked_add(transfer_amount).ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+        // self.reward_pool.vault_token_balance = self.reward_pool.vault_token_balance.checked_add(transfer_amount).ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+        // The above line is redundant as vault_token_balance is set to reward_pool_token_account.amount after transfer which is effectively the new total.
+        // However, the total_undistributed_rewards should be incremented by the transfer_amount.
+        self.reward_pool.vault_token_balance = self.reward_pool_token_account.amount;
 
-        // Calculate NGO and user portions using the transfer amount
-        let ngo_portion = (transfer_amount * self.global_state.weighted_donation_rate)
-            .checked_div(PRECISION_FACTOR)
+
+        // Total undistributed contains the sum of all rewards that have come into the pool but not yet been "assigned" or "claimed" by users/NGOs.
+        // It is incremented by the full transfer_amount.
+        self.reward_pool.total_undistributed_rewards = self.reward_pool.total_undistributed_rewards
+            .checked_add(transfer_amount)
             .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        let user_portion = transfer_amount
-            .checked_sub(ngo_portion)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        // Update reward pool with NGO portion
-        // !TODO: I need to check if there is some kind of double counting here??
-        self.reward_pool.ngo_pending_rewards = self.reward_pool.ngo_pending_rewards
-            .checked_add(ngo_portion)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        // Total undistributed contains both the user and ngo portions
-        self.reward_pool.total_undistributed_rewards = self.reward_pool.total_undistributed_rewards.checked_add(transfer_amount).ok_or(error!(ErrorCode::ArithmeticOverflow))?;
         
-        // Update global accumulators if there are staked tokens
+        // Update global yield accumulator if there is gSOL supply
         if self.global_state.total_gsol_supply > 0 {
-            self.global_state.acc_reward_per_share = self.global_state.acc_reward_per_share
-                .checked_add((user_portion * PRECISION_FACTOR) / self.global_state.total_gsol_supply)
-                .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+            let reward_increment = transfer_amount
+                .checked_mul(PRECISION_FACTOR)
+                .ok_or(error!(ErrorCode::ArithmeticOverflow))?
+                .checked_div(self.global_state.total_gsol_supply)
+                .ok_or(error!(ErrorCode::DivisionByZero))?; // Ensure DivisionByZero is handled if total_gsol_supply is 0, though guarded by if
 
-            self.global_state.acc_ngo_donation_per_share = self.global_state.acc_ngo_donation_per_share
-                .checked_add((ngo_portion * PRECISION_FACTOR) / self.global_state.total_gsol_supply)
+            self.global_state.acc_total_yield_per_gsol = self.global_state.acc_total_yield_per_gsol
+                .checked_add(reward_increment)
                 .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
         }
 
@@ -381,45 +435,7 @@ impl<'info> TransferJitoVaultRewardToRewardPool<'info> {
     }
 }
 
-impl<'info> ProcessRewards<'info> {
-    pub fn process_rewards(&mut self) -> Result<()> {
-        // Validate that the user's last claim was from a previous block
-        if self.user_account.last_claim_time >= Clock::get()?.unix_timestamp {
-            return Err(error!(ErrorCode::RewardAlreadyClaimed));
-        }
-
-        // Calculate reward using accumulator difference
-        let reward_delta = self.global_state.acc_reward_per_share
-            .checked_sub(self.user_account.last_reward_checkpoint)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        let gross_pending = (self.user_account.gsol_balance * reward_delta)
-            .checked_div(PRECISION_FACTOR)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        // Calculate NGO donation portion
-        let ngo_donation_delta = self.global_state.acc_ngo_donation_per_share
-            .checked_sub(self.user_account.last_ngo_donation_checkpoint)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        let ngo_donation = (self.user_account.gsol_balance * ngo_donation_delta)
-            .checked_div(PRECISION_FACTOR)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        // Update user's checkpoints
-        self.user_account.last_reward_checkpoint = self.global_state.acc_reward_per_share;
-        self.user_account.last_ngo_donation_checkpoint = self.global_state.acc_ngo_donation_per_share;
-        self.user_account.last_claim_time = Clock::get()?.unix_timestamp;
-        self.user_account.last_claim_block = self.global_state.current_block_index;
-
-        // Update total claimed amount
-        self.user_account.total_claimed = self.user_account.total_claimed
-            .checked_add(gross_pending)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        Ok(())
-    }
-}
+// impl ProcessRewards block is removed.
 
 // impl<'info> UpdateRewardAccumulators<'info> {
 //     pub fn update_accumulators(&mut self, reward_amount: u64) -> Result<()> {
@@ -461,22 +477,37 @@ impl<'info> ProcessRewards<'info> {
 
 impl<'info> ClaimNgoRewards<'info> {
     pub fn claim_ngo_rewards(&mut self) -> Result<()> {
+        let ngo_account = &mut self.ngo_account;
+        let reward_pool = &mut self.reward_pool;
+
         // Check if NGO has pending rewards
-        if self.ngo_account.pending_rewards == 0 {
+        if ngo_account.pending_claimable_donations == 0 {
             return Err(error!(ErrorCode::NoPendingRewards));
         }
 
         // Check if enough time has passed since last claim
         let now = Clock::get()?.unix_timestamp;
-        if now <= self.ngo_account.last_claim_time {
+        if now <= ngo_account.last_claim_time {
             return Err(error!(ErrorCode::RewardAlreadyClaimed));
         }
 
-        // Transfer rewards to NGO
-        let transfer_amount = self.ngo_account.pending_rewards;
+        let transfer_amount = ngo_account.pending_claimable_donations;
+
+        // Check if reward pool has enough balance (important!)
+        if self.reward_pool_token_account.amount < transfer_amount {
+            return Err(error!(ErrorCode::InsufficientRewardBalance));
+        }
         
+        // Prepare seeds for CPI
+        let seeds = &[
+            b"reward_pool_authority",
+            self.jito_sol_mint.to_account_info().key.as_ref(),
+            &[reward_pool.bump], 
+        ];
+        let signer_seeds = &[&seeds[..]];
+
         anchor_spl::token_interface::transfer_checked(
-            CpiContext::new(
+            CpiContext::new_with_signer(
                 self.token_program.to_account_info(),
                 anchor_spl::token_interface::TransferChecked {
                     from: self.reward_pool_token_account.to_account_info(),
@@ -484,85 +515,113 @@ impl<'info> ClaimNgoRewards<'info> {
                     to: self.ngo_token_account.to_account_info(),
                     authority: self.reward_pool_authority.to_account_info(),
                 },
+                signer_seeds,
             ),
             transfer_amount,
             self.jito_sol_mint.decimals,
         )?;
 
         // Update NGO account state
-        self.ngo_account.pending_rewards = 0;
-        self.ngo_account.last_claim_time = now;
-        self.ngo_account.total_donations_received = self.ngo_account.total_donations_received
+        ngo_account.pending_claimable_donations = 0;
+        ngo_account.last_claim_time = now;
+        ngo_account.total_donations_received = ngo_account.total_donations_received
             .checked_add(transfer_amount)
             .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+        // ngo_account.last_ngo_checkpoint is removed.
 
-        // Update checkpoint to current accumulator value
-        self.ngo_account.last_ngo_checkpoint = self.global_state.acc_ngo_donation_per_share;
+        // Update reward pool state
+        reward_pool.reload()?; // Reload to get latest state if CPI changed it (though transfer_checked doesn't modify reward_pool directly)
+        reward_pool.total_undistributed_rewards = reward_pool.total_undistributed_rewards
+            .checked_sub(transfer_amount)
+            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
 
         Ok(())
     }
 }
 
-impl<'info> DistributeNgoRewards<'info> {
-    pub fn distribute_ngo_rewards(&mut self) -> Result<()> {
-        // Only admin can distribute rewards
-        if self.admin.key() != Pubkey::from_str(ADMIN_ADRESS).unwrap() {
-            return Err(error!(ErrorCode::Unauthorized));
-        }
-
-        // Calculate NGO's weight (W_n) - sum of (G_i × D_i) for all users donating to this NGO
-        let ngo_weight = self.ngo_account.total_users_donating
-            .checked_mul(self.global_state.weighted_donation_rate)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        // Calculate pending donation using checkpoint system
-        // Pending_donation_n = W_n × (A_N - Checkpoint_N,n)
-        let ngo_share = if ngo_weight > 0 {
-            let acc_difference = self.global_state.acc_ngo_donation_per_share
-                .checked_sub(self.ngo_account.last_ngo_checkpoint)
-                .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-            ngo_weight
-                .checked_mul(acc_difference)
-                .ok_or(error!(ErrorCode::ArithmeticOverflow))?
-                .checked_div(PRECISION_FACTOR)
-                .ok_or(error!(ErrorCode::DivisionByZero))?
-        } else {
-            0
-        };
-
-        // Update NGO's pending rewards
-        self.ngo_account.pending_rewards = self.ngo_account.pending_rewards
-            .checked_add(ngo_share)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        // Update NGO's checkpoint
-        self.ngo_account.last_ngo_checkpoint = self.global_state.acc_ngo_donation_per_share;
-
-        Ok(())
-    }
-}
+// impl DistributeNgoRewards is removed.
 
 
 impl<'info> ClaimStakerRewards<'info> {
     pub fn claim_staker_rewards(&mut self) -> Result<()> {
-
         let current_time = Clock::get()?.unix_timestamp;
+        let user_account = &mut self.user_account;
+        let global_state = &self.global_state;
+        let user_ngo_account = &mut self.user_ngo_account; // Made mutable for the option
 
-        let staking_duration = current_time.checked_sub(self.user_account.stake_time).ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-
-        if staking_duration < 86400 {
+        // Optional: Keep staking duration check as a business rule for eligibility
+        let staking_duration = current_time
+            .checked_sub(user_account.stake_time)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        if staking_duration < 86400 { // 86400 seconds = 1 day
             return Err(error!(ErrorCode::StakingPeriodTooShort));
         }
-        let time_weighted_balance = (self.user_account.gsol_balance as u128)
-            .checked_mul(staking_duration as u128)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
 
-        let gross_pending = (time_weighted_balance * self.global_state.acc_reward_per_share as u128)
-            .checked_div(PRECISION_FACTOR as u128)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+        // Prepare ngo_account_option for the helper function
+        let ngo_opt: Option<&mut Account<NGOAccount>> = if user_account.ngo_address != Pubkey::default() {
+            // Ensure the provided user_ngo_account is the one selected by the user.
+            if user_ngo_account.key() != user_account.ngo_address {
+                return err!(ErrorCode::InvalidNgoAccountForClaim);
+            }
+            Some(user_ngo_account)
+        } else {
+            None
+        };
 
-     
+        // Call the helper function to update pending rewards and credit NGO
+        update_user_rewards_and_credit_ngo(
+            user_account,
+            global_state,
+            ngo_opt,
+        )?;
+
+        let amount_to_claim = user_account.pending_rewards;
+
+        if amount_to_claim == 0 {
+            return Err(error!(ErrorCode::NoPendingRewards));
+        }
+
+        // Check if reward pool has enough balance
+        if self.reward_pool_token_account.amount < amount_to_claim {
+            return Err(error!(ErrorCode::InsufficientRewardBalance));
+        }
+        
+        // Transfer rewards from reward pool to user
+        let seeds = &[
+            b"reward_pool_authority",
+            self.jito_sol_mint.to_account_info().key.as_ref(),
+            &[self.reward_pool.bump], // Assuming reward_pool struct has bump field for its authority
+        ];
+        let signer_seeds = &[&seeds[..]];
+
+        anchor_spl::token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token_interface::TransferChecked {
+                    from: self.reward_pool_token_account.to_account_info(),
+                    mint: self.jito_sol_mint.to_account_info(),
+                    to: self.user_jitosol_ata.to_account_info(),
+                    authority: self.reward_pool_authority.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            amount_to_claim,
+            self.jito_sol_mint.decimals,
+        )?;
+
+        // Update user account state
+        user_account.total_claimed = user_account.total_claimed
+            .checked_add(amount_to_claim)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        user_account.pending_rewards = 0;
+        user_account.last_claim_time = current_time;
+        user_account.last_claim_block = global_state.current_block_index;
+        
+        // Reload reward pool account to reflect transferred amount
+        self.reward_pool.reload()?;
+        self.reward_pool.total_undistributed_rewards = self.reward_pool.total_undistributed_rewards
+            .checked_sub(amount_to_claim)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
 
 
         Ok(())

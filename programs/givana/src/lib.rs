@@ -54,13 +54,11 @@ pub mod givana {
         msg!("line 51");
         if let Some(ngo_addr) = ngo_address {
             ctx.accounts.set_donation_rate_and_address(donation_rate, ngo_addr)?;
-            ctx.accounts.ngo_account.total_users_donating += 1;
+            // Line for total_users_donating is fully removed.
             ctx.accounts.user_account.ngo_address = ngo_addr;
         }
         
-        // Update the weighted donation rate
-        msg!("line 53");
-        ctx.accounts.update_weighted_donation_rate(amount)?;
+        // Update the weighted donation rate call is fully removed.
         
         // Mint the nSOL tokens
         msg!("line 55");
@@ -123,14 +121,5 @@ pub mod givana {
         Ok(())
     }
 
-    pub fn process_rewards(ctx: Context<ProcessRewards>) -> Result<()> {
-        ctx.accounts.process_rewards()?;
-        Ok(())
-    }
-
-
-
-    
-
-
+    // process_rewards function (and any comments related to it) is fully removed.
 }

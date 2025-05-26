@@ -6,9 +6,7 @@ use anchor_lang::InitSpace;
 pub struct GlobalState {
     pub total_jitosol_deposited: u64,
     pub total_gsol_supply: u64,
-    pub acc_reward_per_share: u64,
-    pub acc_ngo_donation_per_share: u64,
-    pub weighted_donation_rate: u64,
+    pub acc_total_yield_per_gsol: u64,
     pub current_block_index: u64,
     pub total_nsol_minted: u64,
     pub last_update_time: i64,
@@ -32,8 +30,7 @@ pub struct UserAccount {
     pub donation_rate: u16,
     pub ngo_address: Pubkey,
     pub stake_time: i64,
-    pub last_reward_checkpoint: u64,
-    pub last_ngo_donation_checkpoint: u64,
+    pub last_total_yield_checkpoint: u64,
     pub last_claim_time: i64,
     pub last_claim_block: u64,  // Track which block the user last claimed rewards
     pub total_claimed: u64,
@@ -42,10 +39,6 @@ pub struct UserAccount {
     pub withdraw_request_time: i64,
     pub withdraw_amount: u64,
     pub pending_rewards: u64,
-    pub pending_ngo_donation: u64,
-}
-impl UserAccount {
-    pub const LEN: usize = 32 + 8 + 2 + 32 + 8 + 8 + 8 + 8 + 1;
 }
 
 #[account]
@@ -55,11 +48,10 @@ pub struct NGOAccount {
     pub is_active: bool,
     pub pending_rewards: u64,        // Rewards waiting to be claimed
     pub last_claim_time: i64,        // Last time rewards were claimed
-    pub total_users_donating: u64,   // Number of users donating to this NGO
     pub total_donations_received: u64, // Total donations received (in jitoSOL)
-    pub last_ngo_checkpoint: u64,    // Last checkpoint for NGO reward calculation
+    pub pending_claimable_donations: u64,
     pub bump: u8,
-} 
+}
 
 #[account]
 #[derive(InitSpace)]

@@ -123,79 +123,100 @@ pub struct Deposit<'info> {
 
 
 impl<'info> Deposit<'info> {
-pub fn deposit(&mut self, amount: u64, ngo_address: Option<Pubkey>) -> Result<()> {
-   // Check if the user account is initialized
-  
+pub fn deposit(&mut self, amount: u64, ngo_address_param: Option<Pubkey>) -> Result<()> {
+    let user_account = &mut self.user_account;
+    let global_state = &self.global_state;
+    // self.ngo_account is loaded based on the input `ngo_address_param` from the instruction arguments
 
+    if user_account.is_initialized && user_account.gsol_balance > 0 {
+        let mut ngo_ref_option = None;
+        if user_account.ngo_address != Pubkey::default() {
+            // User has an existing NGO.
+            // self.ngo_account is loaded based on ngo_address_param.
+            // It must match the user's current NGO for rewards to be settled for that NGO.
+            if self.ngo_account.key() == user_account.ngo_address {
+                ngo_ref_option = Some(&mut self.ngo_account);
+            } else {
+                msg!("User's current NGO {} does not match the provided ngo_address_param (or param was None). NGO rewards for current NGO will not be updated in this transaction.", user_account.ngo_address);
+            }
+        }
+        // If user_account.ngo_address is Pubkey::default(), no NGO to pass, ngo_ref_option remains None.
+        
+        update_user_rewards_and_credit_ngo(
+            user_account,
+            global_state,
+            ngo_ref_option,
+        )?;
+    }
+   
    let current_time = Clock::get()?.unix_timestamp;
    
-   if !self.user_account.is_initialized {
-   // use set_inner to set the account data
-   self.user_account.set_inner(UserAccount {
-    authority: self.authority.key(),
-    gsol_balance: 0,
-    donation_rate: 0,
-    ngo_address: ngo_address.unwrap_or(Pubkey::default()),
-    stake_time: 0,
-    last_reward_checkpoint: 0,
-    last_ngo_donation_checkpoint: 0, // Not being updated anywhere 
-    last_claim_time: 0,
-    last_claim_block: 0,
-    withdraw_requested: false,
-    withdraw_request_time: 0,
-    withdraw_amount: 0,
-    pending_rewards: 0,
-    pending_ngo_donation: 0,
-    total_claimed: 0,
-    is_initialized: true,
-   });
+   if !user_account.is_initialized {
+       user_account.set_inner(UserAccount {
+        authority: self.authority.key(),
+        gsol_balance: 0, // gSOL balance is updated by mint_gsol_tokens instruction
+        donation_rate: 0, // Default, can be set by set_donation_rate_and_address
+        ngo_address: ngo_address_param.unwrap_or(Pubkey::default()), // Set if provided with first deposit
+        stake_time: current_time, // Set when user account is first initialized
+        last_total_yield_checkpoint: global_state.acc_total_yield_per_gsol, // Initialize checkpoint
+        last_claim_time: 0,
+        last_claim_block: 0,
+        total_claimed: 0,
+        is_initialized: true,
+        withdraw_requested: false,
+        withdraw_request_time: 0,
+        withdraw_amount: 0,
+        pending_rewards: 0,
+        // Obsolete fields (last_reward_checkpoint, last_ngo_donation_checkpoint, pending_ngo_donation) are removed
+       });
    }
-   else {
-    let time_diff = current_time
-                .checked_sub(self.user_account.stake_time)
-                .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+   // For existing users, stake_time is not reset here.
+   // gsol_balance is managed by mint_gsol_tokens / burn_gsol_tokens (latter not in this file).
 
+   // Handle NGO address logic for the deposit
+   if ngo_address_param.is_some() {
+       let new_ngo_addr_val = ngo_address_param.unwrap();
+       // self.ngo_account is loaded based on new_ngo_addr_val.
+       // Ensure it's active and the key matches.
+       require!(self.ngo_account.is_active, ErrorCode::NgoNotActive);
+       require!(self.ngo_account.key() == new_ngo_addr_val, ErrorCode::InvalidNgoAuthority); // Sanity check
+
+       if user_account.ngo_address == Pubkey::default() {
+           // User is setting NGO for the first time along with deposit.
+           user_account.ngo_address = new_ngo_addr_val;
+       } else {
+           // User already has an NGO. It must match the one provided in deposit.
+           // To change NGO, they must use set_donation_rate_and_address.
+           require!(
+               user_account.ngo_address == new_ngo_addr_val,
+               ErrorCode::NgoAlreadySet // Or a more specific error like "CannotChangeNgoViaDeposit"
+           );
+       }
    }
+   // If ngo_address_param is None, user_account.ngo_address remains unchanged.
 
-   if ngo_address != None {
-    // If NGO is specified, check if it's active
-    require!(self.ngo_account.is_active, ErrorCode::NgoNotActive);
-
-    msg!("ngo_address: {:?}", ngo_address.unwrap());
-    msg!("SETTED NGO ADDRESS: {:?}", self.ngo_account.key());
-
-    // If user hasn't set an NGO before, allow setting this NGO
-    if self.user_account.ngo_address == Pubkey::default() {
-        self.user_account.ngo_address = ngo_address.unwrap();
-    } else {
-        // If user already has an NGO, ensure it's the same one
-        require!(
-            self.user_account.ngo_address == ngo_address.unwrap(),
-            ErrorCode::NgoAlreadySet
-        );
-    }
-}
-
-   // transfer jito from authority to vault
-   let cpi_account = TransferChecked{
+   // Transfer JitoSOL from user to vault
+   let cpi_accounts_transfer = TransferChecked {
     from: self.staker_jito_sol_ata.to_account_info(),
     to: self.vault.to_account_info(),
     mint: self.jito_mint.to_account_info(),
     authority: self.authority.to_account_info(),
    };
-
-   let cpi_program = self.token_program.to_account_info();
-   let cpi_ctx = CpiContext::new(cpi_program, cpi_account);
-   transfer_checked(cpi_ctx, amount, self.jito_mint.decimals)?;
-   msg!("line 146");
-   // update the global state
-   self.global_state.total_jitosol_deposited += amount;
-
+   let cpi_program_transfer = self.token_program.to_account_info();
+   let cpi_ctx_transfer = CpiContext::new(cpi_program_transfer, cpi_accounts_transfer);
+   transfer_checked(cpi_ctx_transfer, amount, self.jito_mint.decimals)?;
    
-
+   // Update global state for total JitoSOL deposited
+   self.global_state.total_jitosol_deposited = self.global_state.total_jitosol_deposited
+    .checked_add(amount)
+    .ok_or(ErrorCode::ArithmeticOverflow)?;
    
+   // Note: The actual minting of gSOL (which increases user_account.gsol_balance) 
+   // and nSOL happens via separate instructions (mint_gsol_tokens, mint_nsol_tokens),
+   // presumably called by the client after this deposit instruction.
+   // The update_weighted_donation_rate function is removed as it's obsolete.
    
-Ok(())
+   Ok(())
 }
 
 pub fn mint_gsol_tokens(&mut self, amount: u64) -> Result<()> {
@@ -276,84 +297,78 @@ pub fn mint_nsol_tokens(&mut self, amount: u64) -> Result<()> {
 
     Ok(())
 }
-pub fn set_donation_rate_and_address(&mut self, donation_rate: u16, ngo_address: Pubkey) -> Result<()> {
-    // Check if the ngo_address and donation rate is already set. If it is set to any ngo address, dont allow to set it again
-    if donation_rate > 10000 {
+pub fn set_donation_rate_and_address(&mut self, new_donation_rate: u16, new_ngo_address: Pubkey) -> Result<()> {
+    let user_account = &mut self.user_account;
+    let global_state = &self.global_state;
+    // self.ngo_account is loaded based on the `new_ngo_address` parameter.
+
+    if new_donation_rate > 10000 {
         return Err(error!(ErrorCode::InvalidDonationRate));
     }
 
-    if !self.ngo_account.is_active {
-        return Err(error!(ErrorCode::NgoNotActive));
+    // Ensure the new NGO account is active if a new NGO address is being set.
+    // self.ngo_account is loaded based on new_ngo_address. So, if new_ngo_address is default(),
+    // self.ngo_account might be for the default pubkey which might not be 'active'.
+    // This check should only apply if new_ngo_address is not Pubkey::default().
+    if new_ngo_address != Pubkey::default() {
+        require!(self.ngo_account.is_active, ErrorCode::NgoNotActive);
+        // Also ensure that the loaded self.ngo_account corresponds to new_ngo_address.
+        // This is implicitly handled by how seeds are defined for self.ngo_account if new_ngo_address is used in seeds.
+        // However, a direct key check is good for safety if applicable.
+        // For this structure: seeds = [b"ngo", ngo_address.unwrap_or(Pubkey::default()).as_ref()]
+        // if new_ngo_address is the one from instruction, this should hold.
+        require!(self.ngo_account.key() == new_ngo_address, ErrorCode::InvalidNgoAuthority);
     }
 
-    // if self.user_account.ngo_address != Pubkey::default() {
-    //     return Err(error!(ErrorCode::NgoAlreadySet));
-    // }
 
-    // Store the donation rate and NGO address
-    self.user_account.donation_rate = donation_rate;
-    self.user_account.ngo_address = ngo_address;
-    self.user_account.stake_time = Clock::get()?.unix_timestamp;
+    // Settle rewards with the current/old NGO before changing settings.
+    let mut called_update_rewards = false;
+    if user_account.is_initialized && user_account.gsol_balance > 0 {
+        let mut old_ngo_ref_mut_option = None;
 
-    Ok(())
-}
+        if user_account.ngo_address != Pubkey::default() {
+            // User has an existing NGO.
+            if user_account.ngo_address == new_ngo_address {
+                // The new NGO is the same as the old one (user is likely just changing the rate).
+                // We can use self.ngo_account because it's loaded for new_ngo_address which is same as old.
+                old_ngo_ref_mut_option = Some(&mut self.ngo_account);
+            } else {
+                // User is changing from an old NGO to a new NGO.
+                // This instruction, as defined, loads self.ngo_account based on new_ngo_address.
+                // It does not have the old NGO's account if it's different.
+                return Err(error!(ErrorCode::ChangingNgoNotSupportedDirectly));
+            }
+        }
+        // If user_account.ngo_address was Pubkey::default(), then no old NGO to settle with;
+        // old_ngo_ref_mut_option remains None, which is correct.
 
-pub fn update_weighted_donation_rate(&mut self, new_stake_amount: u64) -> Result<()> {
-    let current_total_stake = self.global_state.total_jitosol_deposited
-        .checked_sub(new_stake_amount)
-        .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+        update_user_rewards_and_credit_ngo(
+            user_account,
+            global_state,
+            old_ngo_ref_mut_option,
+        )?;
+        called_update_rewards = true;
+    }
+
+    // Update user account with new settings
+    user_account.donation_rate = new_donation_rate;
+    user_account.ngo_address = new_ngo_address;
     
-    let donation_rate = self.user_account.donation_rate;
-    // new_weighted_rate = (current_weighted_rate * current_total_stake + donation_rate * new_stake_amount) / total_stake
-    // This formula calculates the new global weighted donation rate when a user makes a new deposit.
-    // It works by:
-    // 1. Taking the current weighted rate and multiplying it by the current total stake
-    //    - This gives us the total weighted contribution of all existing stakes
-    // 2. Adding the new user's weighted contribution
-    //    - This is their donation rate multiplied by their new stake amount
-    // 3. Dividing by the new total stake
-    //    - This gives us the new average weighted rate across all stakes
-    //
-    let new_weighted_rate = if current_total_stake > 0 {
-        // Convert donation rate to same precision as weighted_rate
-        let scaled_donation_rate = (donation_rate as u64)
-            .checked_mul(PRECISION_FACTOR)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?
-            .checked_div(10000)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
+    // As per original logic, stake_time is updated. This might reset staking duration calculations depending on its usage.
+    user_account.stake_time = Clock::get()?.unix_timestamp;
 
-        // Calculate total weighted contribution
-        let current_weighted_contribution = self.global_state.weighted_donation_rate
-            .checked_mul(current_total_stake)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-        
-        let new_weighted_contribution = scaled_donation_rate
-            .checked_mul(new_stake_amount)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-        
-        let total_stake = current_total_stake
-            .checked_add(new_stake_amount)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?;
-        
-        // Calculate new weighted rate
-        current_weighted_contribution
-            .checked_add(new_weighted_contribution)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?
-            .checked_div(total_stake)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?
-    } else {
-        // For first deposit, scale the donation rate
-        (donation_rate as u64)
-            .checked_mul(PRECISION_FACTOR)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?
-            .checked_div(10000)
-            .ok_or(error!(ErrorCode::ArithmeticOverflow))?
-    };
+    // If update_user_rewards_and_credit_ngo was not called (e.g., gsol_balance is 0),
+    // ensure the checkpoint is updated to the current global accumulator value.
+    if !called_update_rewards { 
+        user_account.last_total_yield_checkpoint = global_state.acc_total_yield_per_gsol;
+    }
+    // If update_user_rewards_and_credit_ngo was called, it already updated the checkpoint.
 
-    self.global_state.weighted_donation_rate = new_weighted_rate;
     Ok(())
 }
 
+// Obsolete update_weighted_donation_rate and the incorrect calculate_gsol_token_amount removed.
+// The correct calculate_gsol_token_amount method remains.
 pub fn calculate_gsol_token_amount(&self, amount: u64) -> Result<u64> {
     // For first deposit, use 1:1 ratio
     if self.global_state.total_gsol_supply == 0 {

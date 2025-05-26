@@ -65,7 +65,7 @@ impl <'info> RegisterNgo<'info> {
             last_claim_time: 0,
             total_users_donating: 0,
             total_donations_received: 0,
-            last_ngo_checkpoint: 0,
+            // last_ngo_checkpoint: 0, // Field removed from NGOAccount
             bump: ctx.bumps.ngo_account,
         });
         Ok(())

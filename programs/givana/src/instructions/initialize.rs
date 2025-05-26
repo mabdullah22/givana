@@ -156,9 +156,9 @@
         
         global_state.total_jitosol_deposited = 0;
         global_state.total_gsol_supply = 0;
-        global_state.acc_reward_per_share = 0;
-        global_state.acc_ngo_donation_per_share = 0;
-        global_state.weighted_donation_rate = 0;
+        // global_state.acc_reward_per_share = 0; // Obsolete: Replaced by acc_total_yield_per_gsol, which is initialized by InitSpace or should be 0 by default.
+        // global_state.acc_ngo_donation_per_share = 0; // Obsolete
+        // global_state.weighted_donation_rate = 0; // Obsolete
         global_state.current_block_index = 0;
         global_state.last_update_time = Clock::get()?.unix_timestamp;
         global_state.input_token_mint = self.jito_mint.key();

@@ -61,4 +61,8 @@ pub enum ErrorCode {
     StakingPeriodTooShort,
     #[msg("NGO already active")]
     NgoAlreadyActive,
+    #[msg("Changing NGO directly is not supported. Settle rewards for the old NGO first or use a dedicated instruction.")]
+    ChangingNgoNotSupportedDirectly,
+    #[msg("Provided NGO account for claim does not match user's selected NGO.")]
+    InvalidNgoAccountForClaim,
 }
