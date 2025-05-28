@@ -65,4 +65,8 @@ pub enum ErrorCode {
     ChangingNgoNotSupportedDirectly,
     #[msg("Provided NGO account for claim does not match user's selected NGO.")]
     InvalidNgoAccountForClaim,
+    #[msg("NGO account is not active or its key does not match the user's selected NGO for withdrawal.")]
+    NgoNotActiveOrMismatch,
+    #[msg("Total gSOL supply is zero, cannot calculate withdrawal value.")]
+    NoSupplyForWithdrawalCalculation,
 }
