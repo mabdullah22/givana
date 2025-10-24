@@ -23,7 +23,7 @@ A Solana-based staking protocol that allows users to stake their assets while au
 
 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/givana.git
+git clone https://github.com/mabdullah22/givana.git
 cd givana
 ```
 
